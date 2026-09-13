@@ -7,49 +7,45 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body, html { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: sans-serif; }
-    
     #video { display: none; }
-    #canvas { width: 100vw; height: 100vh; object-fit: cover; }
-    
+    #canvas { width: 100vw; height: 100vh; display: block; }
     #controls {
       position: absolute; top: 12px; left: 12px; z-index: 10;
-      display: flex; gap: 8px;
+      display: flex; gap: 8px; flex-wrap: wrap;
     }
-    button {
-      background: rgba(20, 20, 20, 0.7); color: #fff; border: 1px solid rgba(255,255,255,0.3);
-      padding: 8px 14px; border-radius: 20px; font-size: 13px; backdrop-filter: blur(4px);
+    button, select {
+      background: rgba(20, 20, 20, 0.75); color: #fff; border: 1px solid rgba(255,255,255,0.3);
+      padding: 8px 12px; border-radius: 16px; font-size: 13px; backdrop-filter: blur(6px);
+      outline: none; max-width: 220px;
     }
   </style>
-  <!-- MediaPipe Hands CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 </head>
 <body>
 
   <div id="controls">
-    <button id="switchCamBtn">📷 Сменить камеру</button>
-    <button id="resetWinBtn">↺ Центр окна</button>
+    <select id="camSelect"><option>Поиск камер...</option></select>
+    <button id="resetWinBtn">↺ Центр</button>
   </div>
 
-  <video id="video" playsinline></video>
+  <video id="video" playsinline autoplay muted></video>
   <canvas id="canvas"></canvas>
 
   <script>
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
+    const camSelect = document.getElementById('camSelect');
 
-    let currentFacingMode = "environment"; // "environment" — задняя, "user" — фронтальная
-    let cameraInstance = null;
+    let currentStream = null;
+    let videoDevices = [];
 
-    // Параметры виртуального окна
     const win = {
-      x: 60, y: 150, w: 260, h: 180,
+      x: 40, y: 140, w: 250, h: 160,
       title: "Парящее окно AR",
       isDragging: false,
       dragOffsetX: 0,
-      dragOffsetY: 0,
-      color: "rgba(20, 25, 35, 0.75)"
+      dragOffsetY: 0
     };
 
     function resize() {
@@ -66,33 +62,109 @@
 
     hands.setOptions({
       maxNumHands: 1,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.6,
-      minTrackingConfidence: 0.6
+      modelComplexity: 0, // Ускоряет работу на мобильных чипах
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
     });
 
     hands.onResults(onResults);
 
-    function startCamera() {
-      if (cameraInstance) cameraInstance.stop();
-      cameraInstance = new Camera(video, {
-        onFrame: async () => {
-          await hands.send({ image: video });
-        },
-        facingMode: currentFacingMode,
-        width: 1280,
-        height: 720
-      });
-      cameraInstance.start();
+    // Поиск всех задних модулей камеры (включая 0.5x Ultra-Wide)
+    async function initCameraList() {
+      try {
+        const initialStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        initialStream.getTracks().forEach(t => t.stop());
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        videoDevices = devices.filter(d => d.kind === 'videoinput');
+
+        camSelect.innerHTML = '';
+        videoDevices.forEach((device, index) => {
+          const opt = document.createElement('option');
+          opt.value = device.deviceId;
+          // Помечаем объективы (wide, ultrawide, back)
+          const label = device.label.toLowerCase();
+          let name = `Камера ${index + 1}`;
+          if (label.includes('ultra') || label.includes('wide') || label.includes('0') || label.includes('back 0')) {
+            name += ' (Широкоугольная / 0.5x)';
+          } else if (label.includes('back')) {
+            name += ' (Основная 1x)';
+          } else if (label.includes('front')) {
+            name += ' (Фронтальная)';
+          }
+          opt.text = device.label || name;
+          camSelect.appendChild(opt);
+        });
+
+        // Пытаемся автоматически выбрать второй сенсор (часто именно он сверхширик)
+        if (videoDevices.length > 1) {
+          camSelect.selectedIndex = 1;
+        }
+        startSelectedCamera();
+      } catch (err) {
+        console.error("Ошибка доступа к камере:", err);
+      }
     }
 
-    // Отрисовка и логика жестов
+    async function startSelectedCamera() {
+      if (currentStream) {
+        currentStream.getTracks().forEach(t => t.stop());
+      }
+
+      const deviceId = camSelect.value;
+      const constraints = {
+        video: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          facingMode: deviceId ? undefined : { ideal: "environment" },
+          // Честный вертикальный кадр под пропорции телефона
+          width: { ideal: 1080 },
+          height: { ideal: 2400 },
+          frameRate: { ideal: 30 }
+        },
+        audio: false
+      };
+
+      try {
+        currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = currentStream;
+        video.onloadedmetadata = () => {
+          video.play();
+          processFrame();
+        };
+      } catch (err) {
+        // Запасной запуск, если точные параметры не приняты
+        currentStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId } });
+        video.srcObject = currentStream;
+        video.play();
+        processFrame();
+      }
+    }
+
+    async function processFrame() {
+      if (!video.paused && !video.ended) {
+        await hands.send({ image: video });
+      }
+      requestAnimationFrame(processFrame);
+    }
+
     function onResults(results) {
       ctx.save();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // 1. Отрисовка видеопотока на весь экран
-      ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+      // Отрисовка видео с сохранением пропорций без лишнего кропа
+      const vRatio = video.videoWidth / video.videoHeight;
+      const cRatio = canvas.width / canvas.height;
+      let drawW = canvas.width, drawH = canvas.height, offsetX = 0, offsetY = 0;
+
+      if (vRatio > cRatio) {
+        drawW = canvas.height * vRatio;
+        offsetX = (canvas.width - drawW) / 2;
+      } else {
+        drawH = canvas.width / vRatio;
+        offsetY = (canvas.height - drawH) / 2;
+      }
+
+      ctx.drawImage(results.image, offsetX, offsetY, drawW, drawH);
 
       let cursorX = null;
       let cursorY = null;
@@ -101,31 +173,20 @@
       if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
         const landmarks = results.multiHandLandmarks[0];
 
-        // Точка 4: кончик большого пальца, Точка 8: кончик указательного
-        const thumb = landmarks[4];
-        const index = landmarks[8];
-
-        // Координаты в пикселях
-        const thumbX = (1 - thumb.x) * canvas.width; // Инвертируем по X, если зеркалит
-        const thumbY = thumb.y * canvas.height;
-        const indexX = (1 - index.x) * canvas.width;
-        const indexY = index.y * canvas.height;
+        // Точки: 4 (большой палец), 8 (указательный)
+        const thumbX = offsetX + landmarks[4].x * drawW;
+        const thumbY = offsetY + landmarks[4].y * drawH;
+        const indexX = offsetX + landmarks[8].x * drawW;
+        const indexY = offsetY + landmarks[8].y * drawH;
 
         cursorX = indexX;
         cursorY = indexY;
 
-        // Расстояние между большим и указательным пальцем
         const dist = Math.hypot(thumbX - indexX, thumbY - indexY);
-        
-        // Порог срабатывания щипка (pinch)
-        if (dist < 45) {
-          isPinching = true;
-        }
+        if (dist < 40) isPinching = true;
 
-        // 2. Логика перетаскивания окна щипком
         if (isPinching) {
           if (!win.isDragging) {
-            // Проверяем, находится ли палец внутри окна
             if (cursorX >= win.x && cursorX <= win.x + win.w &&
                 cursorY >= win.y && cursorY <= win.y + win.h) {
               win.isDragging = true;
@@ -140,82 +201,58 @@
           win.isDragging = false;
         }
 
-        // Рисуем указатель пальца
         drawCursor(cursorX, cursorY, isPinching);
       } else {
         win.isDragging = false;
       }
 
-      // 3. Отрисовка окна
       drawWindow();
-
       ctx.restore();
     }
 
     function drawWindow() {
-      ctx.save();
-      // Тело окна
-      ctx.fillStyle = win.isDragging ? "rgba(35, 60, 100, 0.85)" : win.color;
-      ctx.strokeStyle = win.isDragging ? "#00f0ff" : "rgba(255, 255, 255, 0.4)";
+      ctx.fillStyle = win.isDragging ? "rgba(20, 80, 160, 0.85)" : "rgba(18, 22, 32, 0.75)";
+      ctx.strokeStyle = win.isDragging ? "#00f0ff" : "rgba(255, 255, 255, 0.3)";
       ctx.lineWidth = 2;
-      
       ctx.beginPath();
       ctx.roundRect(win.x, win.y, win.w, win.h, 12);
       ctx.fill();
       ctx.stroke();
 
-      // Шапка окна
       ctx.fillStyle = "rgba(255, 255, 255, 0.15)";
       ctx.beginPath();
-      ctx.roundRect(win.x, win.y, win.w, 34, [12, 12, 0, 0]);
+      ctx.roundRect(win.x, win.y, win.w, 32, [12, 12, 0, 0]);
       ctx.fill();
 
-      // Текст шапки
       ctx.fillStyle = "#ffffff";
       ctx.font = "bold 13px sans-serif";
-      ctx.fillText(win.title, win.x + 12, win.y + 22);
+      ctx.fillText(win.title, win.x + 12, win.y + 20);
 
-      // Контент окна
       ctx.fillStyle = "rgba(255,255,255,0.7)";
       ctx.font = "12px sans-serif";
-      ctx.fillText("Зажми щипок (Pinch)", win.x + 15, win.y + 70);
-      ctx.fillText("чтобы схватить и нести", win.x + 15, win.y + 90);
-
-      // Индикатор статуса захвата внутри окна
-      ctx.fillStyle = win.isDragging ? "#00ff88" : "rgba(255,255,255,0.3)";
-      ctx.beginPath();
-      ctx.arc(win.x + win.w - 18, win.y + 18, 5, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.restore();
+      ctx.fillText("Сомкни пальцы (щипок),", win.x + 15, win.y + 65);
+      ctx.fillText("чтобы схватить окно", win.x + 15, win.y + 85);
     }
 
     function drawCursor(x, y, isPinching) {
       ctx.save();
       ctx.beginPath();
       ctx.arc(x, y, isPinching ? 12 : 8, 0, Math.PI * 2);
-      ctx.fillStyle = isPinching ? "#00ff88" : "#00e1ff";
-      ctx.shadowColor = isPinching ? "#00ff88" : "#00e1ff";
-      ctx.shadowBlur = 10;
+      ctx.fillStyle = isPinching ? "#00ff88" : "#00f0ff";
+      ctx.shadowColor = isPinching ? "#00ff88" : "#00f0ff";
+      ctx.shadowBlur = 8;
       ctx.fill();
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
-      ctx.stroke();
       ctx.restore();
     }
 
-    // Кнопки интерфейса
-    document.getElementById('switchCamBtn').addEventListener('click', () => {
-      currentFacingMode = currentFacingMode === "environment" ? "user" : "environment";
-      startCamera();
-    });
-
+    camSelect.addEventListener('change', startSelectedCamera);
     document.getElementById('resetWinBtn').addEventListener('click', () => {
       win.x = (canvas.width - win.w) / 2;
       win.y = (canvas.height - win.h) / 2;
     });
 
-    startCamera();
+    initCameraList();
   </script>
 </body>
 </html>
+>
