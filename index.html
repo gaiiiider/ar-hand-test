@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Mobile AR Spatial Window</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body, html { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: sans-serif; }
+    
+    #video { display: none; }
+    #canvas { width: 100vw; height: 100vh; object-fit: cover; }
+    
+    #controls {
+      position: absolute; top: 12px; left: 12px; z-index: 10;
+      display: flex; gap: 8px;
+    }
+    button {
+      background: rgba(20, 20, 20, 0.7); color: #fff; border: 1px solid rgba(255,255,255,0.3);
+      padding: 8px 14px; border-radius: 20px; font-size: 13px; backdrop-filter: blur(4px);
+    }
+  </style>
+  <!-- MediaPipe Hands CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <div id="controls">
+    <button id="switchCamBtn">📷 Сменить камеру</button>
+    <button id="resetWinBtn">↺ Центр окна</button>
+  </div>
+
+  <video id="video" playsinline></video>
+  <canvas id="canvas"></canvas>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    let currentFacingMode = "environment"; // "environment" — задняя, "user" — фронтальная
+    let cameraInstance = null;
+
+    // Параметры виртуального окна
+    const win = {
+      x: 60, y: 150, w: 260, h: 180,
+      title: "Парящее окно AR",
+      isDragging: false,
+      dragOffsetX: 0,
+      dragOffsetY: 0,
+      color: "rgba(20, 25, 35, 0.75)"
+    };
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Инициализация MediaPipe Hands
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+
+    hands.onResults(onResults);
+
+    function startCamera() {
+      if (cameraInstance) cameraInstance.stop();
+      cameraInstance = new Camera(video, {
+        onFrame: async () => {
+          await hands.send({ image: video });
+        },
+        facingMode: currentFacingMode,
+        width: 1280,
+        height: 720
+      });
+      cameraInstance.start();
+    }
+
+    // Отрисовка и логика жестов
+    function onResults(results) {
+      ctx.save();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // 1. Отрисовка видеопотока на весь экран
+      ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+      let cursorX = null;
+      let cursorY = null;
+      let isPinching = false;
+
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks = results.multiHandLandmarks[0];
+
+        // Точка 4: кончик большого пальца, Точка 8: кончик указательного
+        const thumb = landmarks[4];
+        const index = landmarks[8];
+
+        // Координаты в пикселях
+        const thumbX = (1 - thumb.x) * canvas.width; // Инвертируем по X, если зеркалит
+        const thumbY = thumb.y * canvas.height;
+        const indexX = (1 - index.x) * canvas.width;
+        const indexY = index.y * canvas.height;
+
+        cursorX = indexX;
+        cursorY = indexY;
+
+        // Расстояние между большим и указательным пальцем
+        const dist = Math.hypot(thumbX - indexX, thumbY - indexY);
+        
+        // Порог срабатывания щипка (pinch)
+        if (dist < 45) {
+          isPinching = true;
+        }
+
+        // 2. Логика перетаскивания окна щипком
+        if (isPinching) {
+          if (!win.isDragging) {
+            // Проверяем, находится ли палец внутри окна
+            if (cursorX >= win.x && cursorX <= win.x + win.w &&
+                cursorY >= win.y && cursorY <= win.y + win.h) {
+              win.isDragging = true;
+              win.dragOffsetX = cursorX - win.x;
+              win.dragOffsetY = cursorY - win.y;
+            }
+          } else {
+            win.x = cursorX - win.dragOffsetX;
+            win.y = cursorY - win.dragOffsetY;
+          }
+        } else {
+          win.isDragging = false;
+        }
+
+        // Рисуем указатель пальца
+        drawCursor(cursorX, cursorY, isPinching);
+      } else {
+        win.isDragging = false;
+      }
+
+      // 3. Отрисовка окна
+      drawWindow();
+
+      ctx.restore();
+    }
+
+    function drawWindow() {
+      ctx.save();
+      // Тело окна
+      ctx.fillStyle = win.isDragging ? "rgba(35, 60, 100, 0.85)" : win.color;
+      ctx.strokeStyle = win.isDragging ? "#00f0ff" : "rgba(255, 255, 255, 0.4)";
+      ctx.lineWidth = 2;
+      
+      ctx.beginPath();
+      ctx.roundRect(win.x, win.y, win.w, win.h, 12);
+      ctx.fill();
+      ctx.stroke();
+
+      // Шапка окна
+      ctx.fillStyle = "rgba(255, 255, 255, 0.15)";
+      ctx.beginPath();
+      ctx.roundRect(win.x, win.y, win.w, 34, [12, 12, 0, 0]);
+      ctx.fill();
+
+      // Текст шапки
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 13px sans-serif";
+      ctx.fillText(win.title, win.x + 12, win.y + 22);
+
+      // Контент окна
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.font = "12px sans-serif";
+      ctx.fillText("Зажми щипок (Pinch)", win.x + 15, win.y + 70);
+      ctx.fillText("чтобы схватить и нести", win.x + 15, win.y + 90);
+
+      // Индикатор статуса захвата внутри окна
+      ctx.fillStyle = win.isDragging ? "#00ff88" : "rgba(255,255,255,0.3)";
+      ctx.beginPath();
+      ctx.arc(win.x + win.w - 18, win.y + 18, 5, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.restore();
+    }
+
+    function drawCursor(x, y, isPinching) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(x, y, isPinching ? 12 : 8, 0, Math.PI * 2);
+      ctx.fillStyle = isPinching ? "#00ff88" : "#00e1ff";
+      ctx.shadowColor = isPinching ? "#00ff88" : "#00e1ff";
+      ctx.shadowBlur = 10;
+      ctx.fill();
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Кнопки интерфейса
+    document.getElementById('switchCamBtn').addEventListener('click', () => {
+      currentFacingMode = currentFacingMode === "environment" ? "user" : "environment";
+      startCamera();
+    });
+
+    document.getElementById('resetWinBtn').addEventListener('click', () => {
+      win.x = (canvas.width - win.w) / 2;
+      win.y = (canvas.height - win.h) / 2;
+    });
+
+    startCamera();
+  </script>
+</body>
+</html>
